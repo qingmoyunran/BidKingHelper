@@ -38,8 +38,10 @@ ROOM_ID_PATTERN = re.compile(rb'\b(\d{2,5}:\d{12,20})\b')
 
 DEFAULT_SCAN_DURATION = 5 * 60
 DEFAULT_SCAN_INTERVAL = 3
-DEFAULT_SEARCH_RADIUS = 12288
+DEFAULT_SEARCH_LENGTH = 10240
 DEFAULT_OUTPUT_DIR = "logs"
+
+GAME_OVER_PATTERN = "S2C_45_game_over_notify"
 
 EVENT_TYPES = {
     "game_start": {
@@ -55,7 +57,7 @@ EVENT_TYPES = {
         "label": "使用道具",
     },
     "game_over": {
-        "patterns": ["S2C_45_game_over_notify"],
+        "patterns": [GAME_OVER_PATTERN],
         "label": "游戏结束",
     },
 }
@@ -65,10 +67,6 @@ scan_stop_event = threading.Event()
 scan_counter = 0
 saved_json_hashes: Set[str] = set()
 saved_lock = threading.Lock()
-
-
-def _alignment_of(addr: int, base_addr: int) -> int:
-    return (addr - base_addr) % 2
 
 
 def _find_utf16le_brace_candidates(
@@ -140,38 +138,36 @@ def _try_extract_utf16le_json_from_pos(
 def extract_utf16le_json(
     pm: pymem.Pymem,
     anchor_addr: int,
-    search_radius: int = DEFAULT_SEARCH_RADIUS,
+    search_length: int = DEFAULT_SEARCH_LENGTH,
     expected_content: Optional[str] = None,
 ) -> Optional[Tuple[str, int, int]]:
     """
-    以 anchor_addr 为中心，在前后 search_radius 字节范围内搜索
-    UTF-16LE 编码的 JSON 对象。
+    从 anchor_addr 开始，向后方搜索 search_length 字节范围内的
+    UTF-16LE 编码 JSON 对象。
 
-    改进点（对比原版）：
+    搜索策略：只从模式串位置向后搜索，不搜索前方。
     1. 按2字节步长搜索，尊重UTF-16LE对齐
     2. 处理JSON字符串字面量内的花括号（不误计数）
     3. 处理转义字符
-    4. 尝试多个 { 候选位置，按距离排序
+    4. 尝试多个 { 候选位置，按距离排序（近→远）
     5. 验证提取内容为有效JSON
     6. 可选：优先返回包含 expected_content 的JSON
 
     返回 (json_string, start_addr, end_addr) 或 None。
     """
-    start = max(0, anchor_addr - search_radius)
-    read_size = search_radius * 2
+    start = anchor_addr
     try:
-        data = pm.read_bytes(start, read_size)
+        data = pm.read_bytes(start, search_length)
     except Exception:
         return None
 
-    anchor_offset = anchor_addr - start
-    alignment = anchor_offset % 2
+    alignment = anchor_addr % 2
 
     open_braces = _find_utf16le_brace_candidates(data, alignment, 0x7B)
     if not open_braces:
         return None
 
-    open_braces.sort(key=lambda x: abs(x - anchor_offset))
+    open_braces.sort()
 
     for pos in open_braces:
         result = _try_extract_utf16le_json_from_pos(data, pos, start)
@@ -197,17 +193,16 @@ def extract_utf16le_json(
 def extract_utf8_json(
     pm: pymem.Pymem,
     anchor_addr: int,
-    search_radius: int = DEFAULT_SEARCH_RADIUS,
+    search_length: int = DEFAULT_SEARCH_LENGTH,
     expected_content: Optional[str] = None,
 ) -> Optional[Tuple[str, int, int]]:
     """
-    UTF-8 回退：当 UTF-16LE 提取失败时，尝试在锚点附近搜索
-    UTF-8 编码的 JSON 对象。
+    UTF-8 回退：从 anchor_addr 开始，向后方搜索 search_length 字节范围内
+    的 UTF-8 编码 JSON 对象。
     """
-    start = max(0, anchor_addr - search_radius)
-    read_size = search_radius * 2
+    start = anchor_addr
     try:
-        data = pm.read_bytes(start, read_size)
+        data = pm.read_bytes(start, search_length)
     except Exception:
         return None
 
@@ -219,8 +214,7 @@ def extract_utf8_json(
     if not open_braces:
         return None
 
-    anchor_offset = anchor_addr - start
-    open_braces.sort(key=lambda x: abs(x - anchor_offset))
+    open_braces.sort()
 
     for pos in open_braces:
         balance = 0
@@ -267,6 +261,49 @@ def extract_utf8_json(
 
         return (json_str, start + pos, start + end_pos + 1)
 
+    if expected_content:
+        for pos in open_braces:
+            balance = 0
+            in_string = False
+            escape_next = False
+            end_pos = -1
+
+            for i in range(pos, len(data)):
+                b = data[i]
+                if escape_next:
+                    escape_next = False
+                    continue
+                if b == 0x5C and in_string:
+                    escape_next = True
+                    continue
+                if b == 0x22:
+                    in_string = not in_string
+                    continue
+                if not in_string:
+                    if b == 0x7B:
+                        balance += 1
+                    elif b == 0x7D:
+                        balance -= 1
+                        if balance == 0:
+                            end_pos = i
+                            break
+
+            if end_pos == -1:
+                continue
+
+            json_bytes = data[pos : end_pos + 1]
+            try:
+                json_str = json_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+
+            try:
+                json.loads(json_str)
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            return (json_str, start + pos, start + end_pos + 1)
+
     return None
 
 
@@ -274,68 +311,45 @@ def extract_json_near_event(
     pm: pymem.Pymem,
     event_addr: int,
     event_name: str,
-    search_radius: int = DEFAULT_SEARCH_RADIUS,
+    search_length: int = DEFAULT_SEARCH_LENGTH,
 ) -> Optional[Tuple[str, int, int]]:
     """
     事件字符串专用的 JSON 提取策略。
 
+    当 event_name 为 S2C_45_game_over_notify 时，search_length 扩大4倍，
+    因为 game_over 事件的 JSON 通常更大。
+
     策略：
     1. 先尝试 UTF-16LE 提取，优先返回包含事件名的JSON
     2. 再尝试 UTF-16LE 提取，不要求包含事件名（放宽条件）
-    3. 最后尝试 UTF-8 回退提取
-
-    事件字符串在内存中可能是：
-    - JSON 内部的值：{"cmd":"S2C_33_game_start_notify",...}  → { 在事件名之前
-    - JSON 前的标签：S2C_33_game_start_notify {...}          → { 在事件名之后
-    - 独立存储：事件名和JSON分属不同对象                       → 需要更大搜索半径
+    3. 再尝试 UTF-8 回退提取，优先包含事件名
+    4. 最后尝试 UTF-8 回退提取，不要求包含事件名
     """
+    effective_length = search_length
+    if GAME_OVER_PATTERN in event_name:
+        effective_length = search_length * 4
+
     result = extract_utf16le_json(
-        pm, event_addr, search_radius, expected_content=event_name
+        pm, event_addr, effective_length, expected_content=event_name
     )
     if result:
         return result
 
-    result = extract_utf16le_json(pm, event_addr, search_radius)
+    result = extract_utf16le_json(pm, event_addr, effective_length)
     if result:
         return result
 
     result = extract_utf8_json(
-        pm, event_addr, search_radius, expected_content=event_name
+        pm, event_addr, effective_length, expected_content=event_name
     )
     if result:
         return result
 
-    result = extract_utf8_json(pm, event_addr, search_radius)
+    result = extract_utf8_json(pm, event_addr, effective_length)
     if result:
         return result
 
     return None
-
-
-def scan_room_id_suffix(
-    pm: pymem.Pymem, suffix: str
-) -> List[Tuple[int, bytes, bytes]]:
-    if not suffix or not suffix.isdigit():
-        return []
-    pattern = b"".join(ch.encode("utf-16le") for ch in suffix)
-    results = []
-    try:
-        matches = pymem.pattern.pattern_scan_all(
-            pm.process_handle, pattern, return_multiple=True
-        )
-        for addr in matches:
-            start_before = max(0, addr - 512)
-            size_before = addr - start_before
-            before_bytes = (
-                pm.read_bytes(start_before, size_before) if size_before > 0 else b""
-            )
-            after_bytes = (
-                pm.read_bytes(addr, 4096) if addr < 0x7FFFFFFFFFFFFFFF else b""
-            )
-            results.append((addr, before_bytes, after_bytes))
-    except Exception as e:
-        print(f"  扫描房间号后缀时出错: {e}")
-    return results
 
 
 def scan_utf16le_string(pm: pymem.Pymem, target_str: str) -> List[int]:
@@ -462,19 +476,15 @@ def scanning_worker(
     room_id: str,
     scan_duration: int,
     scan_interval: int,
-    search_radius: int,
+    search_length: int,
     output_dir: str,
 ):
     global scan_counter
     start_time = time.time()
     scan_counter = 0
 
-    room_suffix = ""
-    if ":" in room_id:
-        room_suffix = room_id.split(":", 1)[1]
-
-    print(f"[扫描] 开始 | 房间号: {room_id} | 后缀: {room_suffix} | 持续: {scan_duration}s | 间隔: {scan_interval}s")
-
+    print(f"[扫描] 开始 | 房间号: {room_id} | 持续: {scan_duration}s | 间隔: {scan_interval}s")
+    time.sleep(0.5)
     while not scan_stop_event.is_set():
         elapsed = time.time() - start_time
         if elapsed > scan_duration:
@@ -486,39 +496,14 @@ def scanning_worker(
         print(f"第 {scan_counter} 次扫描 | 已过 {elapsed:.0f}s / {scan_duration}s")
         print(f"{'='*60}")
 
-        if room_suffix:
-            _scan_by_room_suffix(pm, room_id, room_suffix, scan_counter, search_radius, output_dir)
-
         for event_key, event_info in EVENT_TYPES.items():
-            _scan_by_event(pm, room_id, event_key, event_info, scan_counter, search_radius, output_dir)
+            _scan_by_event(pm, room_id, event_key, event_info, scan_counter, search_length, output_dir)
 
         scan_stop_event.wait(scan_interval)
 
 
-def _scan_by_room_suffix(
-    pm, room_id, room_suffix, scan_idx, search_radius, output_dir
-):
-    print(f"  [房间后缀] 搜索 {room_suffix} ...")
-    try:
-        suffix_matches = scan_room_id_suffix(pm, room_suffix)
-        if not suffix_matches:
-            print("  [房间后缀] 未找到匹配")
-            return
-
-        print(f"  [房间后缀] 找到 {len(suffix_matches)} 个匹配地址")
-        for addr, before, after in suffix_matches:
-            result = extract_utf16le_json(pm, addr, search_radius)
-            if result:
-                json_str, s_addr, e_addr = result
-                save_json_log(room_id, scan_idx, json_str, s_addr, e_addr, output_dir=output_dir)
-            else:
-                print(f"  [房间后缀] 0x{addr:X} 附近未找到有效JSON")
-    except Exception as e:
-        print(f"  [房间后缀] 扫描出错: {e}")
-
-
 def _scan_by_event(
-    pm, room_id, event_key, event_info, scan_idx, search_radius, output_dir
+    pm, room_id, event_key, event_info, scan_idx, search_length, output_dir
 ):
     for pattern_str in event_info["patterns"]:
         label = event_info["label"]
@@ -532,7 +517,7 @@ def _scan_by_event(
             print(f"  [{label}] 找到 {len(addrs)} 个匹配地址")
             for addr in addrs:
                 result = extract_json_near_event(
-                    pm, addr, pattern_str, search_radius
+                    pm, addr, pattern_str, search_length
                 )
                 if result:
                     json_str, s_addr, e_addr = result
@@ -599,7 +584,7 @@ def packet_callback(packet, pm_holder, scan_thread_holder, config):
                 room_id,
                 config["scan_duration"],
                 config["scan_interval"],
-                config["search_radius"],
+                config["search_length"],
                 config["output_dir"],
             ),
             daemon=True,
@@ -636,7 +621,7 @@ def parse_args():
         epilog=(
             "示例:\n"
             "  python monitor_ram.py\n"
-            "  python monitor_ram.py -d 600 -i 5 -r 16384 -o my_logs\n"
+            "  python monitor_ram.py -d 600 -i 5 -l 16384 -o my_logs\n"
         ),
     )
     parser.add_argument(
@@ -654,11 +639,11 @@ def parse_args():
         help=f"扫描间隔（秒），默认 {DEFAULT_SCAN_INTERVAL}",
     )
     parser.add_argument(
-        "-r",
-        "--radius",
+        "-l",
+        "--length",
         type=int,
-        default=DEFAULT_SEARCH_RADIUS,
-        help=f"JSON搜索半径（字节），默认 {DEFAULT_SEARCH_RADIUS}",
+        default=DEFAULT_SEARCH_LENGTH,
+        help=f"JSON搜索长度（字节），从模式串向后搜索的范围，默认 {DEFAULT_SEARCH_LENGTH}",
     )
     parser.add_argument(
         "-o",
@@ -692,7 +677,7 @@ def main():
     config = {
         "scan_duration": args.duration,
         "scan_interval": args.interval,
-        "search_radius": args.radius,
+        "search_length": args.length,
         "output_dir": args.output,
     }
 
@@ -703,7 +688,7 @@ def main():
     print(f"  服务器: {SERVER_IP}:{SERVER_PORT}")
     print(f"  扫描时长: {config['scan_duration']}s")
     print(f"  扫描间隔: {config['scan_interval']}s")
-    print(f"  搜索半径: {config['search_radius']} bytes")
+    print(f"  搜索长度: {config['search_length']} bytes")
     print(f"  输出目录: {config['output_dir']}")
     print(f"  事件类型: {', '.join(e['label'] for e in EVENT_TYPES.values())}")
     print("=" * 60)
