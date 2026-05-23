@@ -62,6 +62,14 @@ EVENT_TYPES = {
     },
 }
 
+UID_CHECKED_PATTERNS = {
+    "S2C_33_game_start_notify",
+    "S2C_37_game_next_round_notify",
+    "S2C_45_game_over_notify",
+}
+
+GAME_START_KEY = "game_start"
+
 current_room_id = None
 scan_stop_event = threading.Event()
 scan_counter = 0
@@ -81,7 +89,7 @@ def _find_utf16le_brace_candidates(
 
 def _try_extract_utf16le_json_from_pos(
     data: bytes, start_pos: int, base_addr: int
-) -> Optional[Tuple[str, int, int]]:
+) -> Optional[Tuple[str, int, int, dict]]:
     balance = 0
     in_string = False
     escape_next = False
@@ -128,11 +136,11 @@ def _try_extract_utf16le_json_from_pos(
         return None
 
     try:
-        json.loads(json_str)
+        parsed = json.loads(json_str)
     except (json.JSONDecodeError, ValueError):
         return None
 
-    return (json_str, base_addr + start_pos, base_addr + end_pos + 2)
+    return (json_str, base_addr + start_pos, base_addr + end_pos + 2, parsed)
 
 
 def extract_utf16le_json(
@@ -140,20 +148,17 @@ def extract_utf16le_json(
     anchor_addr: int,
     search_length: int = DEFAULT_SEARCH_LENGTH,
     expected_content: Optional[str] = None,
-) -> Optional[Tuple[str, int, int]]:
+) -> Optional[Tuple[str, int, int, dict]]:
     """
     从 anchor_addr 开始，向后方搜索 search_length 字节范围内的
     UTF-16LE 编码 JSON 对象。
 
-    搜索策略：只从模式串位置向后搜索，不搜索前方。
-    1. 按2字节步长搜索，尊重UTF-16LE对齐
-    2. 处理JSON字符串字面量内的花括号（不误计数）
-    3. 处理转义字符
-    4. 尝试多个 { 候选位置，按距离排序（近→远）
-    5. 验证提取内容为有效JSON
-    6. 可选：优先返回包含 expected_content 的JSON
+    优化策略：
+    - 单次遍历：优先匹配含 expected_content 的JSON，同时保留不含的作为回退
+    - 找到含 expected_content 的JSON后立即返回（剪枝）
+    - 返回已解析的 dict，避免下游重复 json.loads
 
-    返回 (json_string, start_addr, end_addr) 或 None。
+    返回 (json_string, start_addr, end_addr, parsed_dict) 或 None。
     """
     start = anchor_addr
     try:
@@ -169,25 +174,68 @@ def extract_utf16le_json(
 
     open_braces.sort()
 
+    fallback = None
+
     for pos in open_braces:
         result = _try_extract_utf16le_json_from_pos(data, pos, start)
         if result is None:
             continue
 
-        json_str, s_addr, e_addr = result
+        json_str, s_addr, e_addr, parsed = result
 
         if expected_content and expected_content not in json_str:
+            if fallback is None:
+                fallback = result
             continue
 
         return result
 
-    if expected_content:
-        for pos in open_braces:
-            result = _try_extract_utf16le_json_from_pos(data, pos, start)
-            if result is not None:
-                return result
+    return fallback
 
-    return None
+
+def _try_extract_utf8_json_from_pos(
+    data: bytes, start_pos: int, base_addr: int
+) -> Optional[Tuple[str, int, int, dict]]:
+    balance = 0
+    in_string = False
+    escape_next = False
+    end_pos = -1
+
+    for i in range(start_pos, len(data)):
+        b = data[i]
+        if escape_next:
+            escape_next = False
+            continue
+        if b == 0x5C and in_string:
+            escape_next = True
+            continue
+        if b == 0x22:
+            in_string = not in_string
+            continue
+        if not in_string:
+            if b == 0x7B:
+                balance += 1
+            elif b == 0x7D:
+                balance -= 1
+                if balance == 0:
+                    end_pos = i
+                    break
+
+    if end_pos == -1:
+        return None
+
+    json_bytes = data[start_pos : end_pos + 1]
+    try:
+        json_str = json_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+    try:
+        parsed = json.loads(json_str)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    return (json_str, base_addr + start_pos, base_addr + end_pos + 1, parsed)
 
 
 def extract_utf8_json(
@@ -195,10 +243,14 @@ def extract_utf8_json(
     anchor_addr: int,
     search_length: int = DEFAULT_SEARCH_LENGTH,
     expected_content: Optional[str] = None,
-) -> Optional[Tuple[str, int, int]]:
+) -> Optional[Tuple[str, int, int, dict]]:
     """
     UTF-8 回退：从 anchor_addr 开始，向后方搜索 search_length 字节范围内
     的 UTF-8 编码 JSON 对象。
+
+    优化策略同 extract_utf16le_json：单次遍历 + 回退 + 剪枝。
+
+    返回 (json_string, start_addr, end_addr, parsed_dict) 或 None。
     """
     start = anchor_addr
     try:
@@ -216,95 +268,23 @@ def extract_utf8_json(
 
     open_braces.sort()
 
+    fallback = None
+
     for pos in open_braces:
-        balance = 0
-        in_string = False
-        escape_next = False
-        end_pos = -1
-
-        for i in range(pos, len(data)):
-            b = data[i]
-            if escape_next:
-                escape_next = False
-                continue
-            if b == 0x5C and in_string:
-                escape_next = True
-                continue
-            if b == 0x22:
-                in_string = not in_string
-                continue
-            if not in_string:
-                if b == 0x7B:
-                    balance += 1
-                elif b == 0x7D:
-                    balance -= 1
-                    if balance == 0:
-                        end_pos = i
-                        break
-
-        if end_pos == -1:
+        result = _try_extract_utf8_json_from_pos(data, pos, start)
+        if result is None:
             continue
 
-        json_bytes = data[pos : end_pos + 1]
-        try:
-            json_str = json_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
-
-        try:
-            json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            continue
+        json_str, s_addr, e_addr, parsed = result
 
         if expected_content and expected_content not in json_str:
+            if fallback is None:
+                fallback = result
             continue
 
-        return (json_str, start + pos, start + end_pos + 1)
+        return result
 
-    if expected_content:
-        for pos in open_braces:
-            balance = 0
-            in_string = False
-            escape_next = False
-            end_pos = -1
-
-            for i in range(pos, len(data)):
-                b = data[i]
-                if escape_next:
-                    escape_next = False
-                    continue
-                if b == 0x5C and in_string:
-                    escape_next = True
-                    continue
-                if b == 0x22:
-                    in_string = not in_string
-                    continue
-                if not in_string:
-                    if b == 0x7B:
-                        balance += 1
-                    elif b == 0x7D:
-                        balance -= 1
-                        if balance == 0:
-                            end_pos = i
-                            break
-
-            if end_pos == -1:
-                continue
-
-            json_bytes = data[pos : end_pos + 1]
-            try:
-                json_str = json_bytes.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-
-            try:
-                json.loads(json_str)
-            except (json.JSONDecodeError, ValueError):
-                continue
-
-            return (json_str, start + pos, start + end_pos + 1)
-
-    return None
+    return fallback
 
 
 def extract_json_near_event(
@@ -312,18 +292,15 @@ def extract_json_near_event(
     event_addr: int,
     event_name: str,
     search_length: int = DEFAULT_SEARCH_LENGTH,
-) -> Optional[Tuple[str, int, int]]:
+) -> Optional[Tuple[str, int, int, dict]]:
     """
     事件字符串专用的 JSON 提取策略。
 
-    当 event_name 为 S2C_45_game_over_notify 时，search_length 扩大4倍，
-    因为 game_over 事件的 JSON 通常更大。
+    当 event_name 为 S2C_45_game_over_notify 时，search_length 扩大4倍。
 
-    策略：
-    1. 先尝试 UTF-16LE 提取，优先返回包含事件名的JSON
-    2. 再尝试 UTF-16LE 提取，不要求包含事件名（放宽条件）
-    3. 再尝试 UTF-8 回退提取，优先包含事件名
-    4. 最后尝试 UTF-8 回退提取，不要求包含事件名
+    策略（每个提取函数内部已做单次遍历+回退优化）：
+    1. 先尝试 UTF-16LE 提取
+    2. 再尝试 UTF-8 回退提取
     """
     effective_length = search_length
     if GAME_OVER_PATTERN in event_name:
@@ -335,17 +312,9 @@ def extract_json_near_event(
     if result:
         return result
 
-    result = extract_utf16le_json(pm, event_addr, effective_length)
-    if result:
-        return result
-
     result = extract_utf8_json(
         pm, event_addr, effective_length, expected_content=event_name
     )
-    if result:
-        return result
-
-    result = extract_utf8_json(pm, event_addr, effective_length)
     if result:
         return result
 
@@ -379,21 +348,25 @@ def format_hex_dump(data: bytes) -> str:
     return "\n".join(lines)
 
 
-def _json_content_hash(json_str: str) -> str:
-    try:
-        parsed = json.loads(json_str)
-        canonical = json.dumps(parsed, sort_keys=True, ensure_ascii=False)
-    except (json.JSONDecodeError, ValueError):
-        canonical = json_str
+def _content_hash(parsed: dict) -> str:
+    canonical = json.dumps(parsed, sort_keys=True, ensure_ascii=False)
     return hashlib.md5(canonical.encode("utf-8")).hexdigest()
 
 
-def _already_saved(json_str: str) -> bool:
-    h = _json_content_hash(json_str)
+def _already_saved(parsed: dict) -> bool:
+    h = _content_hash(parsed)
     with saved_lock:
         if h in saved_json_hashes:
             return True
         saved_json_hashes.add(h)
+        return False
+
+
+def _validate_uid(parsed: dict, room_id: str) -> bool:
+    try:
+        uid = parsed["GameData"]["Uid"]
+        return str(uid) == str(room_id)
+    except (KeyError, TypeError):
         return False
 
 
@@ -403,10 +376,11 @@ def save_json_log(
     json_str: str,
     addr_start: int,
     addr_end: int,
+    parsed: dict,
     event_type: Optional[str] = None,
     output_dir: str = DEFAULT_OUTPUT_DIR,
 ):
-    if _already_saved(json_str):
+    if _already_saved(parsed):
         return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -417,11 +391,7 @@ def save_json_log(
         f"json_log_{safe_room_id}_{scan_idx:03d}{event_tag}_{timestamp}.txt",
     )
 
-    try:
-        parsed = json.loads(json_str)
-        pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
-    except (json.JSONDecodeError, ValueError):
-        pretty = json_str
+    pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
 
     event_label = ""
     if event_type and event_type in EVENT_TYPES:
@@ -471,9 +441,6 @@ def save_debug_hex(
     print(f"  调试数据已保存: {filename}")
 
 
-GAME_START_KEY = "game_start"
-
-
 def scanning_worker(
     pm: pymem.Pymem,
     room_id: str,
@@ -520,22 +487,6 @@ def scanning_worker(
         scan_stop_event.wait(scan_interval)
 
 
-UID_CHECKED_PATTERNS = {
-    "S2C_33_game_start_notify",
-    "S2C_37_game_next_round_notify",
-    "S2C_45_game_over_notify",
-}
-
-
-def _validate_uid(json_str: str, room_id: str) -> bool:
-    try:
-        parsed = json.loads(json_str)
-        uid = parsed["GameData"]["Uid"]
-        return str(uid) == str(room_id)
-    except (json.JSONDecodeError, ValueError, KeyError, TypeError):
-        return False
-
-
 def _scan_by_event(
     pm, room_id, event_key, event_info, scan_idx, search_length, output_dir
 ) -> bool:
@@ -555,9 +506,9 @@ def _scan_by_event(
                     pm, addr, pattern_str, search_length
                 )
                 if result:
-                    json_str, s_addr, e_addr = result
+                    json_str, s_addr, e_addr, parsed = result
                     if pattern_str in UID_CHECKED_PATTERNS:
-                        if not _validate_uid(json_str, room_id):
+                        if not _validate_uid(parsed, room_id):
                             print(f"  [{label}] 0x{addr:X} JSON Uid与房间号不匹配，跳过")
                             continue
                     save_json_log(
@@ -566,27 +517,13 @@ def _scan_by_event(
                         json_str,
                         s_addr,
                         e_addr,
+                        parsed,
                         event_type=event_key,
                         output_dir=output_dir,
                     )
                     saved = True
                 else:
-                    '''
-                    print(f"  [{label}] 0x{addr:X} 附近未找到有效JSON，保存调试数据...")
-                    try:
-                        debug_data = pm.read_bytes(addr, 2048)
-                        save_debug_hex(
-                            room_id,
-                            scan_idx,
-                            pattern_str,
-                            addr,
-                            debug_data,
-                            "event_anchor_forward_2048",
-                            output_dir,
-                        )
-                    except Exception:
-                        pass
-                    '''
+                    print(f"  [{label}] 0x{addr:X} 附近未找到有效JSON")
         except Exception as e:
             print(f"  [{label}] 扫描出错: {e}")
     return saved
