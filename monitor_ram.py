@@ -12,7 +12,7 @@ BidKing 对局信息自动化抓取工具
 支持的事件类型：
 - S2C_33_game_start_notify  游戏开始
 - S2C_37_game_next_round_notify  下一回合
-- S2C_39_game_use_item_notify  使用道具
+- S2C_39_game_use_item  使用道具
 - S2C_45_game_over_notify  游戏结束
 """
 
@@ -70,6 +70,7 @@ UID_CHECKED_PATTERNS = {
 
 GAME_START_KEY = "game_start"
 GAME_OVER_KEY = "game_over"
+GAME_USE_ITEM_KEY = "game_use_item"
 
 _UTF16LE_BRACE = b'\x7b\x00'
 _UTF16LE_CLOSE = b'\x7d\x00'
@@ -264,7 +265,7 @@ def extract_json_near_event(
     """
     effective_length = search_length
     if GAME_OVER_PATTERN in event_name:
-        effective_length = search_length * 4
+        effective_length = search_length * 8
 
     try:
         data = pm.read_bytes(event_addr, effective_length)
@@ -331,6 +332,14 @@ def _validate_uid(parsed: dict, room_id: str) -> bool:
         uid = parsed["GameData"]["Uid"]
         return str(uid) == str(room_id)
     except (KeyError, TypeError):
+        return False
+
+
+def _validate_cast_time(parsed: dict, server_time: int) -> bool:
+    try:
+        cast_time_ms = int(parsed["ItemSkillLog"][0]["CastTime"])
+        return cast_time_ms > server_time * 1000
+    except (KeyError, TypeError, ValueError):
         return False
 
 
@@ -420,6 +429,7 @@ def scanning_worker(
     print(f"[扫描] 开始 | 房间号: {room_id} | 持续: {scan_duration}s | 间隔: {scan_interval}s")
 
     game_start_found = False
+    game_start_server_time: Optional[int] = None
     while not scan_stop_event.is_set():
         elapsed = time.time() - start_time
         if elapsed > scan_duration:
@@ -432,21 +442,27 @@ def scanning_worker(
         print(f"{'='*60}")
 
         if not game_start_found:
-            found = _scan_by_event(
+            found, gs_parsed = _scan_by_event(
                 pm, room_id, GAME_START_KEY, EVENT_TYPES[GAME_START_KEY],
                 scan_counter, search_length, output_dir,
                 stop_on_first=True, fast_scan=True,
             )
-            if found:
+            if found and gs_parsed:
                 game_start_found = True
-                print("[扫描] game_start 已确认，后续扫描跳过此模式串")
+                try:
+                    game_start_server_time = int(gs_parsed["GameData"]["ServerTime"])
+                    print(f"[扫描] game_start 已确认，ServerTime={game_start_server_time}")
+                except (KeyError, TypeError, ValueError):
+                    game_start_server_time = None
+                    print("[扫描] game_start 已确认，但未找到 ServerTime")
         else:
             for event_key, event_info in EVENT_TYPES.items():
                 if event_key == GAME_START_KEY:
                     continue
-                found = _scan_by_event(
+                found, _ = _scan_by_event(
                     pm, room_id, event_key, event_info,
                     scan_counter, search_length, output_dir,
+                    server_time=game_start_server_time,
                 )
                 if found and event_key == GAME_OVER_KEY:
                     print("[扫描] game_over 已确认，提前终止本轮扫描，监听下一个网络包")
@@ -462,8 +478,10 @@ def scanning_worker(
 def _scan_by_event(
     pm, room_id, event_key, event_info, scan_idx, search_length, output_dir,
     stop_on_first: bool = False, fast_scan: bool = False,
-) -> bool:
+    server_time: Optional[int] = None,
+) -> Tuple[bool, Optional[dict]]:
     saved = False
+    last_parsed = None
     for pattern_str in event_info["patterns"]:
         label = event_info["label"]
         print(f"  [{label}] 搜索 {pattern_str} ...")
@@ -490,18 +508,23 @@ def _scan_by_event(
                         if not _validate_uid(parsed, room_id):
                             print(f"  [{label}] 0x{addr:X} JSON Uid与房间号不匹配，跳过")
                             continue
+                    if event_key == GAME_USE_ITEM_KEY and server_time is not None:
+                        if not _validate_cast_time(parsed, server_time):
+                            print(f"  [{label}] 0x{addr:X} CastTime未大于ServerTime，跳过")
+                            continue
                     save_json_log(
                         room_id, scan_idx, json_str, s_addr, e_addr, parsed,
                         event_type=event_key, output_dir=output_dir,
                     )
                     saved = True
+                    last_parsed = parsed
                     if stop_on_first:
-                        return True
+                        return True, parsed
                 else:
                     print(f"  [{label}] 0x{addr:X} 附近未找到有效JSON")
 
             if saved and stop_on_first:
-                return True
+                return True, last_parsed
 
             if not saved and fast_scan and len(addrs) == 1:
                 print(f"  [{label}] 快速扫描的地址未提取到JSON，尝试完整扫描...")
@@ -517,16 +540,20 @@ def _scan_by_event(
                             if pattern_str in UID_CHECKED_PATTERNS:
                                 if not _validate_uid(parsed, room_id):
                                     continue
+                            if event_key == GAME_USE_ITEM_KEY and server_time is not None:
+                                if not _validate_cast_time(parsed, server_time):
+                                    continue
                             save_json_log(
                                 room_id, scan_idx, json_str, s_addr, e_addr, parsed,
                                 event_type=event_key, output_dir=output_dir,
                             )
                             saved = True
+                            last_parsed = parsed
                             if stop_on_first:
-                                return True
+                                return True, parsed
         except Exception as e:
             print(f"  [{label}] 扫描出错: {e}")
-    return saved
+    return saved, last_parsed
 
 
 def packet_callback(packet, pm_holder, scan_thread_holder, config):
