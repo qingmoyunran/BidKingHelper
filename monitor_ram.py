@@ -53,7 +53,7 @@ EVENT_TYPES = {
         "label": "下一回合",
     },
     "game_use_item": {
-        "patterns": ["S2C_39_game_use_item_notify"],
+        "patterns": ["S2C_39_game_use_item"],
         "label": "使用道具",
     },
     "game_over": {
@@ -471,6 +471,9 @@ def save_debug_hex(
     print(f"  调试数据已保存: {filename}")
 
 
+GAME_START_KEY = "game_start"
+
+
 def scanning_worker(
     pm: pymem.Pymem,
     room_id: str,
@@ -484,7 +487,8 @@ def scanning_worker(
     scan_counter = 0
 
     print(f"[扫描] 开始 | 房间号: {room_id} | 持续: {scan_duration}s | 间隔: {scan_interval}s")
-    time.sleep(0.5)
+
+    game_start_found = False
     while not scan_stop_event.is_set():
         elapsed = time.time() - start_time
         if elapsed > scan_duration:
@@ -496,15 +500,46 @@ def scanning_worker(
         print(f"第 {scan_counter} 次扫描 | 已过 {elapsed:.0f}s / {scan_duration}s")
         print(f"{'='*60}")
 
-        for event_key, event_info in EVENT_TYPES.items():
-            _scan_by_event(pm, room_id, event_key, event_info, scan_counter, search_length, output_dir)
+        if not game_start_found:
+            found = _scan_by_event(
+                pm, room_id, GAME_START_KEY, EVENT_TYPES[GAME_START_KEY],
+                scan_counter, search_length, output_dir,
+            )
+            if found:
+                game_start_found = True
+                print("[扫描] game_start 已确认，后续扫描跳过此模式串")
+        else:
+            for event_key, event_info in EVENT_TYPES.items():
+                if event_key == GAME_START_KEY:
+                    continue
+                _scan_by_event(
+                    pm, room_id, event_key, event_info,
+                    scan_counter, search_length, output_dir,
+                )
 
         scan_stop_event.wait(scan_interval)
 
 
+UID_CHECKED_PATTERNS = {
+    "S2C_33_game_start_notify",
+    "S2C_37_game_next_round_notify",
+    "S2C_45_game_over_notify",
+}
+
+
+def _validate_uid(json_str: str, room_id: str) -> bool:
+    try:
+        parsed = json.loads(json_str)
+        uid = parsed["GameData"]["Uid"]
+        return str(uid) == str(room_id)
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError):
+        return False
+
+
 def _scan_by_event(
     pm, room_id, event_key, event_info, scan_idx, search_length, output_dir
-):
+) -> bool:
+    saved = False
     for pattern_str in event_info["patterns"]:
         label = event_info["label"]
         print(f"  [{label}] 搜索 {pattern_str} ...")
@@ -521,6 +556,10 @@ def _scan_by_event(
                 )
                 if result:
                     json_str, s_addr, e_addr = result
+                    if pattern_str in UID_CHECKED_PATTERNS:
+                        if not _validate_uid(json_str, room_id):
+                            print(f"  [{label}] 0x{addr:X} JSON Uid与房间号不匹配，跳过")
+                            continue
                     save_json_log(
                         room_id,
                         scan_idx,
@@ -530,7 +569,9 @@ def _scan_by_event(
                         event_type=event_key,
                         output_dir=output_dir,
                     )
+                    saved = True
                 else:
+                    '''
                     print(f"  [{label}] 0x{addr:X} 附近未找到有效JSON，保存调试数据...")
                     try:
                         debug_data = pm.read_bytes(addr, 2048)
@@ -545,8 +586,10 @@ def _scan_by_event(
                         )
                     except Exception:
                         pass
+                    '''
         except Exception as e:
             print(f"  [{label}] 扫描出错: {e}")
+    return saved
 
 
 def packet_callback(packet, pm_holder, scan_thread_holder, config):
