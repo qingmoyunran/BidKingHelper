@@ -471,8 +471,9 @@ def scanning_worker(
 
         if scan_stop_event.is_set():
             break
-
+        '''
         scan_stop_event.wait(scan_interval)
+        '''
 
 
 def _scan_by_event(
