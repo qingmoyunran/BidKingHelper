@@ -69,6 +69,7 @@ UID_CHECKED_PATTERNS = {
 }
 
 GAME_START_KEY = "game_start"
+GAME_OVER_KEY = "game_over"
 
 _UTF16LE_BRACE = b'\x7b\x00'
 _UTF16LE_CLOSE = b'\x7d\x00'
@@ -443,10 +444,17 @@ def scanning_worker(
             for event_key, event_info in EVENT_TYPES.items():
                 if event_key == GAME_START_KEY:
                     continue
-                _scan_by_event(
+                found = _scan_by_event(
                     pm, room_id, event_key, event_info,
                     scan_counter, search_length, output_dir,
                 )
+                if found and event_key == GAME_OVER_KEY:
+                    print("[扫描] game_over 已确认，提前终止本轮扫描，监听下一个网络包")
+                    scan_stop_event.set()
+                    break
+
+        if scan_stop_event.is_set():
+            break
 
         scan_stop_event.wait(scan_interval)
 
