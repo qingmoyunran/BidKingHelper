@@ -1,2 +1,33 @@
-*.txt
-\logs
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Logs (运行时生成)
+logs/
+
+# Tauri / Rust 构建产物
+bidking-client/src-tauri/target/
+bidking-client/src-tauri/gen/
+
+# Node.js / 前端构建产物
+bidking-client/node_modules/
+bidking-client/dist/
+bidking-client/app-icon.png
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 调试文件
+debug_*.txt

@@ -31,8 +31,16 @@ import pymem
 import pymem.pattern
 from scapy.all import sniff, IP, TCP, Raw
 
+try:
+    import win32pipe
+    import win32file
+    import pywintypes
+    HAS_WIN32 = True
+except ImportError:
+    HAS_WIN32 = False
+
 PROCESS_NAME = "BidKing.exe"
-SERVER_IP = "8.133.195.27"
+SERVER_IP = "203.107.63.169"
 SERVER_PORT = 10000
 ROOM_ID_PATTERN = re.compile(rb'\b(\d{2,5}:\d{12,20})\b')
 
@@ -71,6 +79,10 @@ UID_CHECKED_PATTERNS = {
 GAME_START_KEY = "game_start"
 GAME_OVER_KEY = "game_over"
 GAME_USE_ITEM_KEY = "game_use_item"
+
+PIPE_NAME = r"\\.\pipe\bidking_log"
+pipe_handle = None
+pipe_lock = threading.Lock()
 
 _UTF16LE_BRACE = b'\x7b\x00'
 _UTF16LE_CLOSE = b'\x7d\x00'
@@ -343,6 +355,65 @@ def _validate_cast_time(parsed: dict, server_time: int) -> bool:
         return False
 
 
+def pipe_connect():
+    global pipe_handle
+    if not HAS_WIN32:
+        return False
+    try:
+        handle = win32file.CreateFile(
+            PIPE_NAME,
+            win32file.GENERIC_WRITE,
+            0,
+            None,
+            win32file.OPEN_EXISTING,
+            0,
+            None,
+        )
+        with pipe_lock:
+            pipe_handle = handle
+        print(f"[IPC] 已连接到 Named Pipe: {PIPE_NAME}")
+        return True
+    except pywintypes.error as e:
+        if e.winerror == 2:
+            print(f"[IPC] Named Pipe 未就绪（客户端未启动），日志仅保存到文件")
+        else:
+            print(f"[IPC] 连接 Named Pipe 失败: {e}")
+        return False
+
+
+def pipe_send(event_type: str, room_id: str, data: dict):
+    global pipe_handle
+    if not HAS_WIN32:
+        return
+    msg = json.dumps({
+        "type": event_type,
+        "room_id": room_id,
+        "timestamp": datetime.now().isoformat(),
+        "data": data,
+    }, ensure_ascii=False) + "\n"
+    with pipe_lock:
+        if pipe_handle is None:
+            return
+        try:
+            win32file.WriteFile(pipe_handle, msg.encode("utf-8"))
+        except pywintypes.error:
+            pipe_handle = None
+            print("[IPC] 写入失败，尝试重连...")
+            try:
+                pipe_handle = win32file.CreateFile(
+                    PIPE_NAME,
+                    win32file.GENERIC_WRITE,
+                    0, None,
+                    win32file.OPEN_EXISTING,
+                    0, None,
+                )
+                win32file.WriteFile(pipe_handle, msg.encode("utf-8"))
+                print("[IPC] 重连成功")
+            except pywintypes.error:
+                pipe_handle = None
+                print("[IPC] 重连失败，后续日志仅保存到文件")
+
+
 def save_json_log(
     room_id: str,
     scan_idx: int,
@@ -385,6 +456,9 @@ def save_json_log(
         f.write(pretty)
 
     print(f"  JSON 日志已保存: {filename}")
+
+    if event_type:
+        pipe_send(event_type, room_id, parsed)
 
 
 def save_debug_hex(
@@ -700,6 +774,8 @@ def main():
     print(f"  输出目录: {config['output_dir']}")
     print(f"  事件类型: {', '.join(e['label'] for e in EVENT_TYPES.values())}")
     print("=" * 60)
+
+    pipe_connect()
 
     try:
         pm = pymem.Pymem(PROCESS_NAME)
